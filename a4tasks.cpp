@@ -17,6 +17,7 @@
 #define NTASKS 25
 #define NRES_TYPES 10
 //https://stackoverflow.com/questions/17264984/undefined-reference-to-pthread-create correct compile command for pthreads
+//https://www.cs.cmu.edu/afs/cs/academic/class/15492-f07/www/pthreads.html general pthreads information
 using namespace std;
 
 typedef enum {WAIT, RUN, IDLE} STATUS; //thread status
@@ -413,11 +414,20 @@ int main(int argc, char* argv[])
 	START = times(&tmsstart);
 	//first parse the command line input
 	if (argc != 4) { printf("invalid number of arguments\n"); exit(1); }
-	//TODO more error checking
 
 	strcpy(fileName, argv[1]);
 	monitorTime = atoi(argv[2]);
 	ITERATIONS = atoi(argv[3]);
+
+	if (!(monitorTime >= 0) || !(monitorTime < 99999999)) //arbitrarily large number
+	{
+		printf("MonitorTime NOT VALID\n"); exit(1);
+	}
+
+	if (!(ITERATIONS >= 0) || !(ITERATIONS < 99999999)) //arbitrarily large number
+	{
+		printf("ITERATIONS NOT VALID\n"); exit(1);
+	}
 
 	//We need to read the file line by line and map the resources to the resources map and the tasks to the task list
 	readTaskFile(fileName);
