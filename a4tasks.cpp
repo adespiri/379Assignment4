@@ -1,28 +1,22 @@
 #include <stdio.h>
 #include<iostream>
 #include<sys/resource.h>
-#include<sys/wait.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include<vector>
 #include<string>
 #include<boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <pthread.h> 
 #include <fstream>
-#include <poll.h>
-#include <signal.h>
 #include <errno.h>
 #include <time.h> 
-#include <map>
+#include <map> 
 #include <sys/times.h>
 
 #define NTASKS 25
 #define NRES_TYPES 10
-//https://stackoverflow.com/questions/17264984/undefined-reference-to-pthread-create
+//https://stackoverflow.com/questions/17264984/undefined-reference-to-pthread-create correct compile command for pthreads
 using namespace std;
 
 typedef enum {WAIT, RUN, IDLE} STATUS; //thread status
@@ -31,8 +25,12 @@ typedef struct {
 	char name[100];
 	int busyTime;
 	int idleTime;
+	long totalBusyTime;
+	long totalIdleTime;
+	long totalWaitTime;
 	vector<string> reqResources;
 	bool assigned;
+	int timesExecuted;
 	STATUS status;
 } TASK; //contains the details of a particular task (name, busy time, idle time, required resources)
 
@@ -41,10 +39,12 @@ map<string, int> resourceMap; //contain the resources from the file
 vector<TASK> taskList; //contains all the tasks from the file
 pthread_mutex_t threadMutex;
 pthread_mutex_t iterationMutex;
+pthread_mutex_t monitorMutex; // used for monitor to prevent states from switching
 pthread_t TID[NTASKS];
 int ITERATIONS;
 clock_t START, END;
 struct tms tmsstart, tmsend;
+static long clktck = 0;
 
 void mutex_init(pthread_mutex_t* mutex)
 {	//from lab exercise on eclass
@@ -147,6 +147,10 @@ void readTaskFile(char* fileName)
 				temp = strtok(NULL, " ");
 				newTask.assigned = false;
 				newTask.status = IDLE;
+				newTask.totalIdleTime = 0;
+				newTask.totalBusyTime = 0;
+				newTask.totalWaitTime = 0;
+				newTask.timesExecuted = 0;
 				//add resource strings to list
 				while (temp != NULL)
 				{
@@ -227,14 +231,7 @@ float getTime()
 {	// gets time since start of main program execution
 
 	END = times(&tmsend);
-	static long clktck = 0;
-	if (clktck == 0)
-	{
-		if ((clktck = sysconf(_SC_CLK_TCK)) < 0)
-		{
-			printf("systemconf error"); return -1;
-		}
-	}
+
 	clock_t time = END - START;
 	return time/(double) clktck * 1000;
 }
@@ -244,7 +241,14 @@ void runIterations(TASK* task)
   main loop. We use another mutex to handle race conditions with other threads*/
 	int iterationCounter = 0;
 	bool enoughResources;
+	clock_t waitStart, waitFinish; //used to determine how long a task will wait
+	struct tms tmswaitstart, tmswaitend;
+
+	mutex_lock(&monitorMutex); //make sure cannot change state if monitor is printing
 	task->status = WAIT;
+	mutex_unlock(&monitorMutex);
+
+	waitStart = times(&tmswaitstart);
 	while (1)
 	{
 		mutex_lock(&iterationMutex);
@@ -259,24 +263,40 @@ void runIterations(TASK* task)
 		}
 
 		procureResources(task); //will actually grab the resources from the shared resource pool
+		waitFinish = times(&tmswaitend);
+		task->totalWaitTime += (waitFinish - waitStart) / (double)clktck * 1000; //update wait time
 		mutex_unlock(&iterationMutex);
+
 		//after resources are taken, simulate the execution of the process
+		mutex_lock(&monitorMutex); //cant switch states if monitor is printing
 		task->status = RUN;
+		mutex_unlock(&monitorMutex);
 		delay(task->busyTime);
+		task->totalBusyTime += task->busyTime;
+		
 		//after running the busytime then return the resources back to the pool
 		mutex_lock(&iterationMutex);
 		returnResources(task);
 		mutex_unlock(&iterationMutex);
+		
 		//now we wait for idle time and increment iteration counter
+		mutex_lock(&monitorMutex); // cant switch states if monitor printing
 		task->status = IDLE;
+		mutex_unlock(&monitorMutex);
+
 		delay(task->idleTime);
+		task->totalIdleTime += task->idleTime;
 		iterationCounter += 1;
+		task->timesExecuted += 1;
 		//print out iteration info
 		printf("Task: %s (tid= %lu, iter= %d, time= %.0fms) \n", task->name, pthread_self(), iterationCounter, getTime());
 		if (iterationCounter == ITERATIONS) { return; }
-		task->status = WAIT;
-	}
 
+		mutex_lock(&monitorMutex); //cant switch states if monitor printing
+		task->status = WAIT;
+		mutex_unlock(&monitorMutex);
+		waitStart = times(&tmswaitstart);
+	}
 
 }
 
@@ -300,39 +320,114 @@ void *threadExecute(void *arg)
 	pthread_exit(NULL);
 }
 
+void printMonitor()
+{	/*Prints the tasks and their current status*/
+	string waitString = "";
+	string runString = "";
+	string idleString = ""; //3 different strings for the three different states that will be printed
+
+	for (int i = 0; i < taskList.size(); i++)
+	{
+		if (taskList.at(i).status == WAIT) { waitString = waitString + taskList.at(i).name + " "; }
+		else if(taskList.at(i).status == RUN) { runString = runString + taskList.at(i).name + " "; }
+		else { idleString = idleString + taskList.at(i).name + " "; }
+
+	}
+	//print to the terminal
+	printf("\n\nMonitor: [WAIT] %s\n\t [RUN] %s\n\t [IDLE] %s\n\n", waitString.c_str(), 
+		runString.c_str(), idleString.c_str());
+}
+
+void *monitorThread(void *arg)
+{	/*monitor thread that prints out details periodically*/
+	long monitorTime = (long)arg;
+	while (1) //go indefinitely until main program quits
+	{
+		delay(monitorTime);
+		mutex_lock(&monitorMutex);
+		printMonitor();
+		mutex_unlock(&monitorMutex); //monitor mutex ensures the tasks will not change states while printing
+	}
+}
+
+void printTerminationInfo()
+{
+	//iterate through the map and print all resource types and their available counts
+	map<string, int>::iterator itr;
+	printf("\n\nSystem Resources:\n");
+	for (itr = resourceMap.begin(); itr != resourceMap.end(); itr++)
+	{
+		printf("\t\t%s: ", (itr->first).c_str());
+		printf("(maxAvail=\t%d, held=\t0)\n", resourceMap[itr->first]);
+	}
+
+	//print out the task information
+	printf("\n\nSystem Tasks:\n");
+	for (int i = 0; i < taskList.size(); i++)
+	{	
+		char status[20];
+		if (taskList.at(i).status == IDLE) { strcpy(status, "IDLE"); }
+		else if (taskList.at(i).status == WAIT) { strcpy(status, "WAIT"); }
+		else { strcpy(status, "RUN"); }
+		printf("[%d] %s (%s, runTime= %lu msec, idleTime= %lu msec):\n", i, taskList.at(i).name, status,
+			taskList.at(i).totalBusyTime, taskList.at(i).totalIdleTime);
+		printf("\t (tid= %lu\n", TID[i]);
+		//print the required resources
+		for (int j = 0; j < taskList.at(i).reqResources.size(); j++)
+		{	
+			char* resourceName;
+			int resourcesNeeded;
+			char resourceString[50];
+			strcpy(resourceString, taskList.at(i).reqResources.at(j).c_str());
+			resourceName = strtok(resourceString, ":");
+			resourcesNeeded = atoi(strtok(NULL, ":"));
+
+			printf("\t %s: (needed=\t%d, held= 0)\n", resourceName, resourcesNeeded );
+		}
+		printf("\t (RUN: %d times, WAIT: %lu msec\n\n", taskList.at(i).timesExecuted, taskList.at(i).totalWaitTime);
+	}
+
+	//print the total running time of the program
+	printf("Total Running Time: %.0f msec\n\n", getTime());
+}
 
 int main(int argc, char* argv[]) 
 {	
-	int monitorTime;
+	long monitorTime;
 	int rval;
 	char fileName[20];
 	pthread_t ntid;
 
 	mutex_init(&threadMutex);
 	mutex_init(&iterationMutex);
+	mutex_init(&monitorMutex);
+
+	if (clktck == 0) //get number of clock cycles per second. Will be used for timing functions
+	{
+		if ((clktck = sysconf(_SC_CLK_TCK)) < 0)
+		{
+			printf("systemconf error"); return -1;
+		}
+	}
 
 	START = times(&tmsstart);
 	//first parse the command line input
 	if (argc != 4) { printf("invalid number of arguments\n"); exit(1); }
 	//TODO more error checking
-	
-	
+
 	strcpy(fileName, argv[1]);
 	monitorTime = atoi(argv[2]);
 	ITERATIONS = atoi(argv[3]);
 
 	//We need to read the file line by line and map the resources to the resources map and the tasks to the task list
 	readTaskFile(fileName);
-
-	//map<string, int>::iterator it; FOR DEBUGGING
-
-	//for (it = resourceMap.begin(); it != resourceMap.end(); it++)
-	//{
-	//	cout << it->first  // string (key)
-	//		<< ':'
-	//		<< it->second   // string's value 
-	//		<< std::endl;
-	//}
+	
+	//create monitor thread
+	rval = pthread_create(&ntid, NULL, monitorThread, (void*) monitorTime);
+	if (rval) {
+		fprintf(stderr, "pthread_create: %s\n", strerror(rval));
+		exit(1);
+	}
 
 	//for every task in the task list we need to execute a new thread
 	for (long i = 0; i < taskList.size(); i++)
@@ -354,7 +449,9 @@ int main(int argc, char* argv[])
 			exit(1);
 		}
 	}
-
-
+	
+	//handle the termination output
+	printf("\n\nThreads Finished\nMain Program Terminating...\n");
+	printTerminationInfo();
 	return 0;
 }
