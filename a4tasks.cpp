@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <time.h> 
 #include <map>
+#include <sys/times.h>
 
 #define NTASKS 25
 #define NRES_TYPES 10
@@ -36,12 +37,14 @@ typedef struct {
 } TASK; //contains the details of a particular task (name, busy time, idle time, required resources)
 
 //GLOBAL VARIABLES
-map<char*, int> resourceMap; //contain the resources from the file
+map<string, int> resourceMap; //contain the resources from the file
 vector<TASK> taskList; //contains all the tasks from the file
 pthread_mutex_t threadMutex;
 pthread_mutex_t iterationMutex;
 pthread_t TID[NTASKS];
 int ITERATIONS;
+clock_t START, END;
+struct tms tmsstart, tmsend;
 
 void mutex_init(pthread_mutex_t* mutex)
 {	//from lab exercise on eclass
@@ -66,13 +69,12 @@ void addResources(char* nameCountPair)
 	//split the name:count pair and add to the map
 	char tempPair[40];
 	strcpy(tempPair, nameCountPair);
-	char* tempName;
 	int tempCount; 
-	tempName = strtok(tempPair, ":");
+	string tempName(strtok(tempPair, ":"));
 	tempCount = atoi(strtok(NULL, ":"));
 	//add to map https://www.geeksforgeeks.org/map-associative-containers-the-c-standard-template-library-stl/
-	resourceMap.insert(pair<char*, int>(tempName, tempCount));
-
+	//resourceMap.insert(pair<char*, int>(tempName, tempCount));
+	resourceMap[tempName] = tempCount;
 }
 
 void defineResources(char* resourceLine)
@@ -144,7 +146,7 @@ void readTaskFile(char* fileName)
 				newTask.idleTime = atoi(temp);
 				temp = strtok(NULL, " ");
 				newTask.assigned = false;
-				newTask.status = WAIT;
+				newTask.status = IDLE;
 				//add resource strings to list
 				while (temp != NULL)
 				{
@@ -170,29 +172,112 @@ void delay(int milliseconds) //from lab experiments on eClass
 		printf("warning: delay: %s\n", strerror(errno));
 }
 
+bool checkResources(TASK* task)
+{	//this function is called by a thread when it is going to check available resources
+	//We need to check if resources are available to grab, if not then unlock and go back to waiting
+	for (int i = 0; i < task->reqResources.size(); i++)
+	{
+		char resource[50];
+		strcpy(resource, task->reqResources.at(i).c_str());
+		char* resName = strtok(resource, ":");
+		int resCount = atoi(strtok(NULL, ":"));
+
+		if (resourceMap[resName] >= resCount) //if there are enough resources for this thread
+		{
+			continue;
+		}
+
+		else { return false; }
+	}
+	//if the process reaches this point that means there are enough of the required resources
+	return true;
+}
+
+void procureResources(TASK* task)
+{	//this function will decrement the appropriate resources when called
+	for (int i = 0; i < task->reqResources.size(); i++)
+	{
+		char resource[50];
+		strcpy(resource, task->reqResources.at(i).c_str());
+		char* resName = strtok(resource, ":");
+		int resCount = atoi(strtok(NULL, ":"));
+		int currentValue = resourceMap[resName];
+		int newValue = currentValue - resCount;
+		resourceMap[resName] = newValue;
+	}
+	return;
+}
+
+void returnResources(TASK* task)
+{	//this function will return the appropriate resources when called
+	for (int i = 0; i < task->reqResources.size(); i++)
+	{
+		char resource[50];
+		strcpy(resource, task->reqResources.at(i).c_str());
+		char* resName = strtok(resource, ":");
+		int resCount = atoi(strtok(NULL, ":"));
+		int currentValue = resourceMap[resName];
+		int newValue = currentValue + resCount;
+		resourceMap[resName] = newValue;
+	}
+	return;
+}
+
+float getTime()
+{	// gets time since start of main program execution
+
+	END = times(&tmsend);
+	static long clktck = 0;
+	if (clktck == 0)
+	{
+		if ((clktck = sysconf(_SC_CLK_TCK)) < 0)
+		{
+			printf("systemconf error"); return -1;
+		}
+	}
+	clock_t time = END - START;
+	return time/(double) clktck * 1000;
+}
+
 void runIterations(TASK* task)
 { /*After a thread is created, it will come to this function to execute its
   main loop. We use another mutex to handle race conditions with other threads*/
-	int iterationCounter;
+	int iterationCounter = 0;
+	bool enoughResources;
 	task->status = WAIT;
 	while (1)
 	{
 		mutex_lock(&iterationMutex);
 
 		//We need to check if resources are available to grab, if not then unlock and go back to waiting
-		for (int i = 0; i < task->reqResources.size(); i++)
-		{
-			char resource[50];
-			strcpy(resource, task->reqResources.at(i).c_str());
-			char* resName = strtok(resource, ":");
-			int resCount = atoi(strtok(NULL, ":"));
-			cout << resName << endl;
-			cout << resCount << endl;
+		enoughResources = checkResources(task);
+		if (!enoughResources)
+		{	//release mutex and go back to waiting
+			mutex_unlock(&iterationMutex);
+			delay(20);
+			continue;
 		}
+
+		procureResources(task); //will actually grab the resources from the shared resource pool
 		mutex_unlock(&iterationMutex);
+		//after resources are taken, simulate the execution of the process
+		task->status = RUN;
+		delay(task->busyTime);
+		//after running the busytime then return the resources back to the pool
+		mutex_lock(&iterationMutex);
+		returnResources(task);
+		mutex_unlock(&iterationMutex);
+		//now we wait for idle time and increment iteration counter
+		task->status = IDLE;
+		delay(task->idleTime);
+		iterationCounter += 1;
+		//print out iteration info
+		printf("Task: %s (tid= %lu, iter= %d, time= %.0fms) \n", task->name, pthread_self(), iterationCounter, getTime());
+		if (iterationCounter == ITERATIONS) { return; }
+		task->status = WAIT;
 	}
 
-	
+
 }
 
 void *threadExecute(void *arg)
@@ -215,6 +300,7 @@ void *threadExecute(void *arg)
 	pthread_exit(NULL);
 }
 
+
 int main(int argc, char* argv[]) 
 {	
 	int monitorTime;
@@ -222,10 +308,10 @@ int main(int argc, char* argv[])
 	char fileName[20];
 	pthread_t ntid;
 
-
 	mutex_init(&threadMutex);
 	mutex_init(&iterationMutex);
 
+	START = times(&tmsstart);
 	//first parse the command line input
 	if (argc != 4) { printf("invalid number of arguments\n"); exit(1); }
 	//TODO more error checking
@@ -237,6 +323,17 @@ int main(int argc, char* argv[])
 
 	//We need to read the file line by line and map the resources to the resources map and the tasks to the task list
 	readTaskFile(fileName);
+
+	//map<string, int>::iterator it; FOR DEBUGGING
+
+	//for (it = resourceMap.begin(); it != resourceMap.end(); it++)
+	//{
+	//	cout << it->first  // string (key)
+	//		<< ':'
+	//		<< it->second   // string's value 
+	//		<< std::endl;
+	//}
+
 	//for every task in the task list we need to execute a new thread
 	for (long i = 0; i < taskList.size(); i++)
 	{
